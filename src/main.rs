@@ -14,7 +14,6 @@
 
 // Import crates with necessary types into a new project.
 
-extern crate serde;
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
@@ -29,14 +28,15 @@ extern crate iron;
 use exonum::blockchain::{self, Blockchain, Service, GenesisConfig, ValidatorKeys, Transaction,
                          ApiContext};
 use exonum::node::{Node, NodeConfig, NodeApiConfig, TransactionSend, ApiSender, NodeChannel};
-use exonum::messages::{RawTransaction, FromRaw, Message};
-use exonum::storage::{Fork, MemoryDB, MapIndex};
-use exonum::crypto::{PublicKey, Hash, HexValue};
+use exonum::messages::{RawTransaction, FromRaw};
+use exonum::storage::{Fork, MemoryDB, Entry};
+use exonum::crypto::{Hash};
 use exonum::encoding::{self, Field};
 use exonum::api::{Api, ApiError};
 use iron::prelude::*;
 use iron::Handler;
 use router::Router;
+use serde_json::value::Value;
 
 // // // // // // // // // // CONSTANTS // // // // // // // // // //
 
@@ -46,42 +46,82 @@ const SERVICE_ID: u16 = 1;
 
 // Define constants for transaction types within the service.
 
-const TX_CREATE_WALLET_ID: u16 = 1;
-
-const TX_TRANSFER_ID: u16 = 2;
-
-// Define initial balance of a newly created wallet.
-
-const INIT_BALANCE: u64 = 100;
+const TX_GRANT: u16 = 1;
+const TX_DENY: u16 = 2;
 
 // // // // // // // // // // PERSISTENT DATA // // // // // // // // // //
 
 // Declare the data to be stored in the blockchain. In the present case,
 // declare a type for storing information about the wallet and its balance.
 
-/// Declare a [serializable][1]
-/// [1]: https://github.com/exonum/exonum-doc/blob/master/src/architecture/serialization.md
-/// struct and determine bounds of its fields with `encoding_struct!` macro.
+// Declare a [serializable][1]
+// [1]: https://github.com/exonum/exonum-doc/blob/master/src/architecture/serialization.md
+// struct and determine bounds of its fields with `encoding_struct!` macro.
 encoding_struct! {
-    struct Wallet {
-        const SIZE = 48;
+    struct MatrixEntry {
+        const SIZE = 8;
 
-        field pub_key:            &PublicKey  [00 => 32]
-        field name:               &str        [32 => 40]
-        field balance:            u64         [40 => 48]
+        field subject:      u32     [00 => 04]
+        field permission:   u32     [04 => 08]
     }
 }
 
-/// Add methods to the `Wallet` type for changing balance.
-impl Wallet {
-    pub fn increase(&mut self, amount: u64) {
-        let balance = self.balance() + amount;
-        Field::write(&balance, &mut self.raw, 40, 48);
+encoding_struct! {
+    struct Matrix {
+        const SIZE = 8;
+
+        field values:   Vec<MatrixEntry>  [00 => 08]
+    }
+}
+
+impl Matrix {
+    pub fn grant(&mut self, subject: u32, permission: u32) {
+        let values = &mut self.values();
+
+        // slices are of the same length by design
+        let len = values.len();
+
+        for i in 0..len {
+            let s = values[i].subject();
+            let p = values[i].permission();
+
+            if s==subject && p==permission {
+                // such grant already exists
+                return;
+            }
+        }
+
+        let entry = MatrixEntry::new(subject, permission);
+        &values.push(entry);
+
+        Field::write(values, &mut self.raw, 0, 8);
     }
 
-    pub fn decrease(&mut self, amount: u64) {
-        let balance = self.balance() - amount;
-        Field::write(&balance, &mut self.raw, 40, 48);
+    pub fn deny(&mut self, subject: u32, permission: u32) {
+        let values = &mut self.values();
+
+        // slices are of the same length by design
+        let len = values.len();
+        let mut remove_index = len;
+
+        for i in 0..len {
+            let s = values[i].subject();
+            let p = values[i].permission();
+
+            if s==subject && p==permission {
+                // this grant has to be removed
+                remove_index = i;
+                break;
+            }
+        }
+
+        if remove_index==len {
+            return;
+        }
+
+        values.swap_remove(remove_index);
+
+        Field::write(values, &mut self.raw, 00, 08);
     }
 }
 
@@ -89,7 +129,7 @@ impl Wallet {
 
 /// Create schema of the key-value storage implemented by `MemoryDB`. In the
 /// present case a `Fork` of the database is used.
-pub struct CurrencySchema<'a> {
+pub struct MatrixSchema<'a> {
     view: &'a mut Fork,
 }
 
@@ -99,121 +139,115 @@ pub struct CurrencySchema<'a> {
 ///
 /// Isolate the wallets map into a separate entity by adding a unique prefix,
 /// i.e. the first argument to the `MapIndex::new` call.
-impl<'a> CurrencySchema<'a> {
-    pub fn wallets(&mut self) -> MapIndex<&mut Fork, PublicKey, Wallet> {
+impl<'a> MatrixSchema<'a> {
+    // pub fn access_control(&mut self) -> ListIndex<&mut Fork, Matrix> {
+    //     let prefix = blockchain::gen_prefix(SERVICE_ID, 0, &());
+    //     ListIndex::new(prefix, self.view)
+    // }
+    pub fn access_control(&mut self) -> Entry<&mut Fork, Matrix> {
         let prefix = blockchain::gen_prefix(SERVICE_ID, 0, &());
-        MapIndex::new(prefix, self.view)
-    }
-
-    /// Get a separate wallet from the storage.
-    pub fn wallet(&mut self, pub_key: &PublicKey) -> Option<Wallet> {
-        self.wallets().get(pub_key)
+        Entry::new(prefix, self.view)
     }
 }
 
 // // // // // // // // // // TRANSACTIONS // // // // // // // // // //
-
-/// Create a new wallet.
 message! {
-    struct TxCreateWallet {
+    struct TxGrant {
         const TYPE = SERVICE_ID;
-        const ID = TX_CREATE_WALLET_ID;
-        const SIZE = 40;
+        const ID = TX_GRANT;
+        const SIZE = 8;
 
-        field pub_key:     &PublicKey  [00 => 32]
-        field name:        &str        [32 => 40]
+        field entry:    MatrixEntry   [00=>08]
     }
 }
 
-/// Transfer coins between the wallets.
 message! {
-    struct TxTransfer {
+    struct TxDeny {
         const TYPE = SERVICE_ID;
-        const ID = TX_TRANSFER_ID;
-        const SIZE = 80;
+        const ID = TX_DENY;
+        const SIZE = 16;
 
-        field from:        &PublicKey  [00 => 32]
-        field to:          &PublicKey  [32 => 64]
-        field amount:      u64         [64 => 72]
-        field seed:        u64         [72 => 80]
+        field entry:    MatrixEntry   [00=>08]
     }
 }
-
 // // // // // // // // // // CONTRACTS // // // // // // // // // //
 
 /// Execute a transaction.
-impl Transaction for TxCreateWallet {
+impl Transaction for TxGrant {
     /// Verify integrity of the transaction by checking the transaction
     /// signature.
     fn verify(&self) -> bool {
-        self.verify_signature(self.pub_key())
+        true
     }
 
     /// Apply logic to the storage when executing the transaction.
     fn execute(&self, view: &mut Fork) {
-        let mut schema = CurrencySchema { view };
-        if schema.wallet(self.pub_key()).is_none() {
-            let wallet = Wallet::new(self.pub_key(), self.name(), INIT_BALANCE);
-            println!("Create the wallet: {:?}", wallet);
-            schema.wallets().put(self.pub_key(), wallet)
+        let mut schema = MatrixSchema { view };
+
+        if let Some(mut matrix) = schema.access_control().get() {
+            let e = self.entry();
+            let s = e.subject();
+            let p = e.permission();
+            println!("Granting {} with {}", s, p);
+
+            matrix.grant(s, p);
+            println!("After Grant: {:?}\n", matrix);
         }
     }
 }
 
-impl Transaction for TxTransfer {
-    /// Check if the sender is not the receiver. Check correctness of the
-    /// sender's signature.
+impl Transaction for TxDeny {
+    /// Verify integrity of the transaction by checking the transaction
+    /// signature.
     fn verify(&self) -> bool {
-        (*self.from() != *self.to()) && self.verify_signature(self.from())
+        true
     }
 
-    /// Retrieve two wallets to apply the transfer. Check the sender's
-    /// balance and apply changes to the balances of the wallets.
+    /// Apply logic to the storage when executing the transaction.
     fn execute(&self, view: &mut Fork) {
-        let mut schema = CurrencySchema { view };
-        let sender = schema.wallet(self.from());
-        let receiver = schema.wallet(self.to());
-        if let (Some(mut sender), Some(mut receiver)) = (sender, receiver) {
-            let amount = self.amount();
-            if sender.balance() >= amount {
-                sender.decrease(amount);
-                receiver.increase(amount);
-                println!("Transfer between wallets: {:?} => {:?}", sender, receiver);
-                let mut wallets = schema.wallets();
-                wallets.put(self.from(), sender);
-                wallets.put(self.to(), receiver);
-            }
+        let mut schema = MatrixSchema { view };
+
+        if let Some(mut matrix) = schema.access_control().get() {
+            let e = self.entry();
+            let s = e.subject();
+            let p = e.permission();
+            println!("Denying {} with {}", s, p);
+
+            matrix.deny(s, p);
+            println!("After Deny: {:?}\n", matrix);
         }
+
+        // let mut matrix = schema.access_control();
+        // let mut m = matrix
+        //             .pop()
+        //             .unwrap_or(Matrix::new(vec![]));
+
+        // let e = self.entry();
+        // let s = e.subject();
+        // let p = e.permission();
+        // println!("Denying {} with {}", s, p);
+
+        // m.deny(s, p);
+        // println!("Deny: {:?}\n", m);
+
+        // matrix.push(m);
     }
 }
-
 // // // // // // // // // // REST API // // // // // // // // // //
 
 /// Implement the node API.
 #[derive(Clone)]
-struct CryptocurrencyApi {
+struct ACApi {
     channel: ApiSender<NodeChannel>,
     blockchain: Blockchain,
 }
 
 /// Shortcut to get data on wallets.
-impl CryptocurrencyApi {
-    fn get_wallet(&self, pub_key: &PublicKey) -> Option<Wallet> {
+impl ACApi {
+    fn get_access_control(&self) -> Option<Matrix> {
         let mut view = self.blockchain.fork();
-        let mut schema = CurrencySchema { view: &mut view };
-        schema.wallet(pub_key)
-    }
-
-    fn get_wallets(&self) -> Option<Vec<Wallet>> {
-        let mut view = self.blockchain.fork();
-        let mut schema = CurrencySchema { view: &mut view };
-        let idx = schema.wallets();
-        let wallets: Vec<Wallet> = idx.values().collect();
-        if wallets.is_empty() {
-            None
-        } else {
-            Some(wallets)
-        }
+        let mut schema = MatrixSchema { view: &mut view };
+        schema.access_control().get()
     }
 }
 
@@ -222,8 +256,8 @@ impl CryptocurrencyApi {
 #[serde(untagged)]
 #[derive(Clone, Serialize, Deserialize)]
 enum TransactionRequest {
-    CreateWallet(TxCreateWallet),
-    Transfer(TxTransfer),
+    Grant(TxGrant),
+    Deny(TxDeny),
 }
 
 /// Implement a trait for the enum for deserialized `TransactionRequest`s
@@ -231,8 +265,8 @@ enum TransactionRequest {
 impl Into<Box<Transaction>> for TransactionRequest {
     fn into(self) -> Box<Transaction> {
         match self {
-            TransactionRequest::CreateWallet(trans) => Box::new(trans),
-            TransactionRequest::Transfer(trans) => Box::new(trans),
+            TransactionRequest::Grant(trans) => Box::new(trans),
+            TransactionRequest::Deny(trans) => Box::new(trans),
         }
     }
 }
@@ -247,8 +281,9 @@ struct TransactionResponse {
 /// `Api` facilitates conversion between transactions/read requests and REST
 /// endpoints; for example, it parses `POSTed` JSON into the binary transaction
 /// representation used in Exonum internally.
-impl Api for CryptocurrencyApi {
+impl Api for ACApi {
     fn wire(&self, router: &mut Router) {
+
         let self_ = self.clone();
         let transaction = move |req: &mut Request| -> IronResult<Response> {
             match req.get::<bodyparser::Struct<TransactionRequest>>() {
@@ -264,46 +299,32 @@ impl Api for CryptocurrencyApi {
             }
         };
 
-        // Gets status of all wallets.
+        // Gets status of ac.
         let self_ = self.clone();
-        let wallets_info = move |_: &mut Request| -> IronResult<Response> {
-            if let Some(wallets) = self_.get_wallets() {
-                self_.ok_response(&serde_json::to_value(wallets).unwrap())
+        let ac_info = move |_: &mut Request| -> IronResult<Response> {
+            if let Some(ac) = self_.get_access_control() {
+                self_.ok_response(&serde_json::to_value(ac).unwrap())
             } else {
                 self_.not_found_response(
-                    &serde_json::to_value("Wallets database is empty")
+                    &serde_json::to_value("no ac")
                         .unwrap(),
                 )
             }
         };
 
-        // Gets status of the wallet corresponding to the public key.
-        let self_ = self.clone();
-        let wallet_info = move |req: &mut Request| -> IronResult<Response> {
-            let path = req.url.path();
-            let wallet_key = path.last().unwrap();
-            let public_key = PublicKey::from_hex(wallet_key).map_err(ApiError::FromHex)?;
-            if let Some(wallet) = self_.get_wallet(&public_key) {
-                self_.ok_response(&serde_json::to_value(wallet).unwrap())
-            } else {
-                self_.not_found_response(&serde_json::to_value("Wallet not found").unwrap())
-            }
-        };
-
         // Bind the transaction handler to a specific route.
-        router.post("/v1/wallets/transaction", transaction, "transaction");
-        router.get("/v1/wallets", wallets_info, "wallets_info");
-        router.get("/v1/wallet/:pub_key", wallet_info, "wallet_info");
+        router.post("/v1/ac/transaction", transaction, "transaction");
+        router.get("/v1/ac", ac_info, "ac_info");
     }
 }
 
 // // // // // // // // // // SERVICE DECLARATION // // // // // // // // // //
 
 /// Define the service.
-struct CurrencyService;
+struct ACService;
 
 /// Implement a `Service` trait for the service.
-impl Service for CurrencyService {
+impl Service for ACService {
     fn service_name(&self) -> &'static str {
         "cryptocurrency"
     }
@@ -315,8 +336,8 @@ impl Service for CurrencyService {
     /// Implement a method to deserialize transactions coming to the node.
     fn tx_from_raw(&self, raw: RawTransaction) -> Result<Box<Transaction>, encoding::Error> {
         let trans: Box<Transaction> = match raw.message_type() {
-            TX_TRANSFER_ID => Box::new(TxTransfer::from_raw(raw)?),
-            TX_CREATE_WALLET_ID => Box::new(TxCreateWallet::from_raw(raw)?),
+            TX_GRANT => Box::new(TxGrant::from_raw(raw)?),
+            TX_DENY => Box::new(TxDeny::from_raw(raw)?),
             _ => {
                 return Err(encoding::Error::IncorrectMessageType {
                     message_type: raw.message_type(),
@@ -329,12 +350,33 @@ impl Service for CurrencyService {
     /// Create a REST `Handler` to process web requests to the node.
     fn public_api_handler(&self, ctx: &ApiContext) -> Option<Box<Handler>> {
         let mut router = Router::new();
-        let api = CryptocurrencyApi {
+        let api = ACApi {
             channel: ctx.node_channel().clone(),
             blockchain: ctx.blockchain().clone(),
         };
         api.wire(&mut router);
         Some(Box::new(router))
+    }
+
+    fn initialize(&self, fork: &mut Fork) -> Value {
+        // let mut handler = self.handler.lock().unwrap();
+        // let cfg = self.genesis.clone();
+        // let (_, addr) = cfg.redeem_script();
+        // if handler.client.is_some() {
+        //     handler.import_address(&addr).unwrap();
+        // }
+        // AnchoringSchema::new(fork).create_genesis_config(&cfg);
+        // serde_json::to_value(cfg).unwrap()
+
+
+        // MatrixSchema::new(fork);
+
+        let mut schema = MatrixSchema { view: fork };
+        let matrix = Matrix::new(vec![]);
+        schema.view.
+        // schema.access_control().set(matrix);
+
+        serde_json::to_value().unwrap()
     }
 }
 
@@ -345,7 +387,7 @@ fn main() {
 
     println!("Creating in-memory database...");
     let db = MemoryDB::new();
-    let services: Vec<Box<Service>> = vec![Box::new(CurrencyService)];
+    let services: Vec<Box<Service>> = vec![Box::new(ACService)];
     let blockchain = Blockchain::new(Box::new(db), services);
 
     let (consensus_public_key, consensus_secret_key) = exonum::crypto::gen_keypair();
@@ -386,4 +428,6 @@ fn main() {
 
     println!("Blockchain is ready for transactions!");
     node.run().unwrap();
+
+
 }

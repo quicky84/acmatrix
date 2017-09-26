@@ -1,0 +1,13 @@
+{
+    "body": {
+        "entry": {
+            "subject": 2,
+            "permission": 10
+        }
+    },
+    "network_id": 0,
+    "protocol_version": 0,
+    "service_id": 1,
+    "message_id": 1,
+    "signature": "05f51eb13cfaaebc97b27e340048f35f40c7bb6e3ae4c47728dee9908a10636add57700dfce1bcd686dc36fae4fa930d1318fb76a0d5c410b998be1949382209"
+}

@@ -1,8 +1,8 @@
 [package]
-name = "cryptocurrency"
+name = "access_control_matrix"
 version = "0.1.0"
-authors = ["The Exonum Team <exonum@bitfury.com>"]
-repository = "https://github.com/exonum/cryptocurrency"
+authors = ["some people"]
+repository = ""
 readme = "README.md"
 license = "Apache-2.0"
 
