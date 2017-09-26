@@ -373,10 +373,10 @@ impl Service for ACService {
 
         let mut schema = MatrixSchema { view: fork };
         let matrix = Matrix::new(vec![]);
-        schema.view.
-        // schema.access_control().set(matrix);
+        schema.access_control().set(matrix);
 
-        serde_json::to_value().unwrap()
+        // serde_json::to_value(matrix).unwrap()
+        Value::Null
     }
 }
 
