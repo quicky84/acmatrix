@@ -31,7 +31,7 @@ use exonum::node::{Node, NodeConfig, NodeApiConfig, TransactionSend, ApiSender, 
 use exonum::messages::{RawTransaction, FromRaw};
 use exonum::storage::{Fork, MemoryDB, Entry};
 use exonum::crypto::{Hash};
-use exonum::encoding::{self, Field};
+use exonum::encoding::{self};
 use exonum::api::{Api, ApiError};
 use iron::prelude::*;
 use iron::Handler;
@@ -75,53 +75,31 @@ encoding_struct! {
 }
 
 impl Matrix {
-    pub fn grant(&mut self, subject: u32, permission: u32) {
-        let values = &mut self.values();
+    pub fn grant(&mut self, subject: u32, permission: u32) -> Self  {
+        let mut values = self.values();
 
-        // slices are of the same length by design
-        let len = values.len();
+        let index = values
+                    .iter()
+                    .position(|x| (*x).subject() == subject && (*x).permission() == permission);
+        if index.is_none() {
+            let entry = MatrixEntry::new(subject, permission);
+            values.push(entry);
+        };
 
-        for i in 0..len {
-            let s = values[i].subject();
-            let p = values[i].permission();
-
-            if s==subject && p==permission {
-                // such grant already exists
-                return;
-            }
-        }
-
-        let entry = MatrixEntry::new(subject, permission);
-        &values.push(entry);
-
-        Field::write(values, &mut self.raw, 0, 8);
+        Matrix::new(values)
     }
 
-    pub fn deny(&mut self, subject: u32, permission: u32) {
-        let values = &mut self.values();
+    pub fn deny(&mut self, subject: u32, permission: u32) -> Self {
+        let mut values = self.values();
 
-        // slices are of the same length by design
-        let len = values.len();
-        let mut remove_index = len;
+        let index = values
+                    .iter()
+                    .position(|x| (*x).subject() == subject && (*x).permission() == permission);
+        if let Some(i) = index {
+            values.swap_remove(i);
+        };
 
-        for i in 0..len {
-            let s = values[i].subject();
-            let p = values[i].permission();
-
-            if s==subject && p==permission {
-                // this grant has to be removed
-                remove_index = i;
-                break;
-            }
-        }
-
-        if remove_index==len {
-            return;
-        }
-
-        values.swap_remove(remove_index);
-
-        Field::write(values, &mut self.raw, 00, 08);
+        Matrix::new(values)
     }
 }
 
@@ -140,10 +118,6 @@ pub struct MatrixSchema<'a> {
 /// Isolate the wallets map into a separate entity by adding a unique prefix,
 /// i.e. the first argument to the `MapIndex::new` call.
 impl<'a> MatrixSchema<'a> {
-    // pub fn access_control(&mut self) -> ListIndex<&mut Fork, Matrix> {
-    //     let prefix = blockchain::gen_prefix(SERVICE_ID, 0, &());
-    //     ListIndex::new(prefix, self.view)
-    // }
     pub fn access_control(&mut self) -> Entry<&mut Fork, Matrix> {
         let prefix = blockchain::gen_prefix(SERVICE_ID, 0, &());
         Entry::new(prefix, self.view)
@@ -184,15 +158,25 @@ impl Transaction for TxGrant {
     fn execute(&self, view: &mut Fork) {
         let mut schema = MatrixSchema { view };
 
-        if let Some(mut matrix) = schema.access_control().get() {
-            let e = self.entry();
-            let s = e.subject();
-            let p = e.permission();
-            println!("Granting {} with {}", s, p);
+        // Matrix should exist, so it's safe to call expect
+        let mut matrix = schema
+                         .access_control()
+                         .get()
+                         .expect("Matrix is unitialized, this is a bug.");
 
-            matrix.grant(s, p);
-            println!("After Grant: {:?}\n", matrix);
-        }
+        let e = self.entry();
+        let s = e.subject();
+        let p = e.permission();
+
+        println!("Granting {} with {}", s, p);
+        println!("\tBefore Grant:\n\t{:?}", matrix);
+
+        // old matrix consumed there, created modified one
+        let new_matrix = matrix.grant(s, p);
+        // update db state
+        schema.access_control().set(new_matrix);
+
+        println!("\tAfter Grant:\n\t{:?}\n", schema.access_control().get().unwrap());
     }
 }
 
@@ -207,30 +191,26 @@ impl Transaction for TxDeny {
     fn execute(&self, view: &mut Fork) {
         let mut schema = MatrixSchema { view };
 
-        if let Some(mut matrix) = schema.access_control().get() {
-            let e = self.entry();
-            let s = e.subject();
-            let p = e.permission();
-            println!("Denying {} with {}", s, p);
+        // Matrix should exist, so it's safe to call expect
+        let mut matrix = schema
+                         .access_control()
+                         .get()
+                         .expect("Matrix is unitialized, this is a bug.");
 
-            matrix.deny(s, p);
-            println!("After Deny: {:?}\n", matrix);
-        }
 
-        // let mut matrix = schema.access_control();
-        // let mut m = matrix
-        //             .pop()
-        //             .unwrap_or(Matrix::new(vec![]));
+        let e = self.entry();
+        let s = e.subject();
+        let p = e.permission();
 
-        // let e = self.entry();
-        // let s = e.subject();
-        // let p = e.permission();
-        // println!("Denying {} with {}", s, p);
+        println!("Denying {} with {}", s, p);
+        println!("\tBefore Deny:\n\t{:?}", matrix);
 
-        // m.deny(s, p);
-        // println!("Deny: {:?}\n", m);
+         // old matrix consumed there, created modified one
+        let new_matrix = matrix.deny(s, p);
 
-        // matrix.push(m);
+         // update db state
+        schema.access_control().set(new_matrix);
+        println!("\tAfter Deny:\n\t{:?}\n", schema.access_control().get().unwrap());
     }
 }
 // // // // // // // // // // REST API // // // // // // // // // //
@@ -242,7 +222,6 @@ struct ACApi {
     blockchain: Blockchain,
 }
 
-/// Shortcut to get data on wallets.
 impl ACApi {
     fn get_access_control(&self) -> Option<Matrix> {
         let mut view = self.blockchain.fork();
@@ -326,7 +305,7 @@ struct ACService;
 /// Implement a `Service` trait for the service.
 impl Service for ACService {
     fn service_name(&self) -> &'static str {
-        "cryptocurrency"
+        "ac"
     }
 
     fn service_id(&self) -> u16 {
@@ -359,23 +338,10 @@ impl Service for ACService {
     }
 
     fn initialize(&self, fork: &mut Fork) -> Value {
-        // let mut handler = self.handler.lock().unwrap();
-        // let cfg = self.genesis.clone();
-        // let (_, addr) = cfg.redeem_script();
-        // if handler.client.is_some() {
-        //     handler.import_address(&addr).unwrap();
-        // }
-        // AnchoringSchema::new(fork).create_genesis_config(&cfg);
-        // serde_json::to_value(cfg).unwrap()
-
-
-        // MatrixSchema::new(fork);
-
         let mut schema = MatrixSchema { view: fork };
         let matrix = Matrix::new(vec![]);
         schema.access_control().set(matrix);
 
-        // serde_json::to_value(matrix).unwrap()
         Value::Null
     }
 }
